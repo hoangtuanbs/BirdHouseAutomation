@@ -1,21 +1,18 @@
-/*
- Basic ESP8266 MQTT example
- This sketch demonstrates the capabilities of the pubsub library in combination
- with the ESP8266 board/library.
- It connects to an MQTT server then:
-  - publishes "hello world" to the topic "outTopic" every two seconds
-  - subscribes to the topic "inTopic", printing out any messages
-    it receives. NB - it assumes the received payloads are strings not binary
-  - If the first character of the topic "inTopic" is an 1, switch ON the ESP Led,
-    else switch it off
- It will reconnect to the server if the connection is lost using a blocking
- reconnect function. See the 'mqtt_reconnect_nonblocking' example for how to
- achieve the same result without blocking the main loop.
- To install the ESP8266 board, (using Arduino 1.6.4+):
-  - Add the following 3rd party board manager under "File -> Preferences -> Additional Boards Manager URLs":
-       http://arduino.esp8266.com/stable/package_esp8266com_index.json
-  - Open the "Tools -> Board -> Board Manager" and click install for the ESP8266"
-  - Select your ESP8266 in "Tools -> Board"
+#include <IotWebConf.h>
+#include <IotWebConfESP32HTTPUpdateServer.h>
+#include <IotWebConfMultipleWifi.h>
+#include <IotWebConfOptionalGroup.h>
+#include <IotWebConfParameter.h>
+#include <IotWebConfSettings.h>
+#include <IotWebConfTParameter.h>
+#include <IotWebConfTParameterBuilder.h>
+#include <IotWebConfUsing.h>
+#include <IotWebConfWebServerWrapper.h>
+
+/**
+    Humidity sensor
+    Publish data read from Bosch Bme280 sensor to a mqttbroker defined according to specs
+    https://www.mysensors.org/build/mqtt_gateway
 */
 
 #include <ESP8266WiFi.h>
@@ -27,64 +24,127 @@
 #include <Wire.h>
 
 #define SERIAL_BAUD 115200
-
-BME280I2C bme;
-
+#define GLOBAL_SOFTWARE_VERSION "0.1.0"
+#define CONFIG_VERSION "1.0"
 // Update these with values suitable for your network.
 
+
+/**
+ * @brief Device configuration region
+ *
+ */
+
+#include <ESP_EEPROM.h>
+
+#define BROKER_LENGTH 127
+struct ControllerData
+{
+    uint8_t SensorNodeId = 1;
+    uint8_t TempSensorId = 20;
+    uint8_t HumiditySensorId = 21;
+    uint8_t SensorUpdateInterval = 30; // in seconds
+    uint8_t SensorForceUpdateInterval = 30; // in minute
+    float TemperatureSensorDelta = 0.5;
+    float HumiditySensorDelta = 1;
+    char MqttServer[BROKER_LENGTH] = "sitecontroller";
+    char MqttTopic[BROKER_LENGTH] = "g/sc/f/sensor";
+    bool AutomaticFan = true;
+} DeviceConfig;
+
+bool saveRomData()
+{
+    EEPROM.put(0, DeviceConfig);
+
+    return EEPROM.commit();
+}
+
+bool loadRomData()
+{
+    EEPROM.begin(sizeof(ControllerData));
+
+    if (EEPROM.percentUsed()>=0)
+    {
+        EEPROM.get(0, DeviceConfig);
+
+        return true;
+    } else
+    {
+        return saveRomData();
+    }
+}
+
+/* End device configuration */
+
+/**
+ * @brief Device network configuration region
+ *
+ */
 const char *ssid = "GLink";
 const char *password = "Gfarming1512";
 const char *mqtt_server = "sitecontroller";
+String DeviceName{"CombiSensor" + String(ESP.getChipId())};
+// -- Initial password to connect to the Thing, when it creates an own Access Point.
+const char WifiInitialPassword[] = "12345678";
 
-WiFiClient espClient;
-PubSubClient client(espClient);
+#define CONFIG_PIN D2
+#define NUMBER_LEN 32
+#define STRING_LEN 128
+#define STATUS_PIN LED_BUILTIN
+
+WiFiClient LocalEspClient;
+PubSubClient LocalMqttClient(LocalEspClient);
+
+DNSServer LocalDnsServer;
+WebServer LocalWebServer(80);
+
+char stringParamValue[STRING_LEN];
+char intParamValue[NUMBER_LEN];
+char floatParamValue[NUMBER_LEN];
+char checkboxParamValue[STRING_LEN];
+char chooserParamValue[STRING_LEN];
+static char chooserValues[][STRING_LEN] = {"red", "blue", "darkYellow"};
+static char chooserNames[][STRING_LEN] = {"Red", "Blue", "Dark yellow"};
+
+// -- Method declarations.
+void handleRoot();
+// -- Callback methods.
+void configSaved();
+bool formValidator(iotwebconf::WebRequestWrapper *webRequestWrapper);
+
+IotWebConf iotWebConf(DeviceName.c_str(), &LocalDnsServer, &LocalWebServer, WifiInitialPassword, CONFIG_VERSION);
+// -- You can also use namespace formats e.g.: iotwebconf::TextParameter
+IotWebConfTextParameter paramMqttServer =
+        ("Mqtt Server", "mqttServer", DeviceConfig.MqttServer, BROKER_LENGTH, "text", nullptr, DeviceConfig.MqttServer);
+IotWebConfTextParameter paramMqttServer =
+        ("Mqtt Topic", "mqttTopic", DeviceConfig.MqttTopic, BROKER_LENGTH, "text", nullptr, DeviceConfig.MqttTopic);
+
+IotWebConfParameterGroup group1 = IotWebConfParameterGroup("Sensor Config", "");
+IotWebConfNumberParameter intParam = IotWebConfNumberParameter("Int param", "intParam", intParamValue, NUMBER_LEN, "20", "1..100", "min='1' max='100' step='1'");
+IotWebConfNumberParameter paramNodeId = IotWebConfNumberParameter("NodeId", "paramNodeId", DeviceConfig.SensorNodeId, NUMBER_LEN, "1", "1..100", "min='1' max='100' step='1'");
+IotWebConfNumberParameter paramHumidityId = IotWebConfNumberParameter("Humidity id", "paramHumidityId", DeviceConfig.HumiditySensorId, NUMBER_LEN, "1", "1..100", "min='1' max='100' step='1'");
+IotWebConfNumberParameter paramTempId = IotWebConfNumberParameter("Temperature id", "paramHumidityId", DeviceConfig.TempSensorId, NUMBER_LEN, "2", "1..100", "min='1' max='100' step='1'");
+IotWebConfNumberParameter paramUpdateInt = IotWebConfNumberParameter("Temperature id", "paramHumidityId", DeviceConfig.TempSensorId, NUMBER_LEN, "2", "1..100", "min='1' max='100' step='1'");
+IotWebConfNumberParameter paramForceUpdateInt = IotWebConfNumberParameter("Temperature id", "paramHumidityId", DeviceConfig.TempSensorId, NUMBER_LEN, "2", "1..100", "min='1' max='100' step='1'");
+
+// -- We can add a legend to the separator
+IotWebConfParameterGroup group2 = IotWebConfParameterGroup("c_factor", "Calibration factor");
+IotWebConfNumberParameter floatParam = IotWebConfNumberParameter("Float param", "floatParam", floatParamValue, NUMBER_LEN, nullptr, "e.g. 23.4", "step='0.1'");
+IotWebConfCheckboxParameter checkboxParam = IotWebConfCheckboxParameter("Check param", "checkParam", checkboxParamValue, STRING_LEN, true);
+IotWebConfSelectParameter chooserParam = IotWebConfSelectParameter("Choose param", "chooseParam", chooserParamValue, STRING_LEN, (char *)chooserValues, (char *)chooserNames, sizeof(chooserValues) / STRING_LEN, STRING_LEN);
+
 unsigned long lastMsg = 0;
 #define MSG_BUFFER_SIZE (250)
 #define TOPIC_SIZE (250)
 char msg[MSG_BUFFER_SIZE];
 int value = 0;
 
-#define DHTTYPE DHT11
-#define GLOBAL_SOFTWARE_VERSION "0.1.0"
-#define DHT_PIN 3
-#define SENSOR_DELAY 30000
-
-#define V_TEMP 0
-#define V_HUM 1
-
-int _dhtPin = DHT_PIN;
-DHT _dhtSensor(_dhtPin, DHTTYPE);
-
-int fromNode = 1;
-char tempTopic[TOPIC_SIZE];
-int tempSensorId = 20;
-char humTopic[TOPIC_SIZE];
-int humSensorId = 21;
-#define INVALID_VALUE -100
-float _dhtHumidity = INVALID_VALUE;
-float _dhtTemperature = INVALID_VALUE;
-
-#define TEMPERATURE_DELTA 0.5
-#define HUMIDITY_DELTA 1.0
-
-void setup_bme280()
-{
-    Wire.begin();
-
-    while(!bme.begin())
-    {
-        Serial.println("Could not find BME280 sensor!");
-        delay(1000);
-    }
-}
-
-void setup_topics()
+void setupMqttTopics()
 {
     snprintf(tempTopic, TOPIC_SIZE, "g/sc/f/sensor/%d/%d/1/0/%d", fromNode, tempSensorId, V_TEMP);
     snprintf(humTopic, TOPIC_SIZE, "g/sc/f/sensor/%d/%d/1/0/%d", fromNode, humSensorId, V_HUM);
 }
 
-void setup_wifi()
+void setupWifi()
 {
     delay(10);
     // We start by connecting to a WiFi network
@@ -108,6 +168,132 @@ void setup_wifi()
     Serial.println("IP address: ");
     Serial.println(WiFi.localIP());
 }
+
+void setupDevice()
+{
+    group1.addItem(&intParam);
+    group2.addItem(&floatParam);
+    group2.addItem(&checkboxParam);
+    group2.addItem(&chooserParam);
+
+    iotWebConf.setStatusPin(STATUS_PIN);
+    iotWebConf.setConfigPin(CONFIG_PIN);
+    iotWebConf.addSystemParameter(&paramMqttServer);
+    iotWebConf.addParameterGroup(&group1);
+    iotWebConf.addParameterGroup(&group2);
+    iotWebConf.setConfigSavedCallback(&configSaved);
+    iotWebConf.setFormValidator(&formValidator);
+    iotWebConf.getApTimeoutParameter()->visible = true;
+
+    // -- Initializing the configuration.
+    iotWebConf.init();
+
+    // -- Set up required URL handlers on the web server.
+    server.on("/", handleRoot);
+    server.on("/config", []
+              { iotWebConf.handleConfig(); });
+    server.onNotFound([]()
+                      { iotWebConf.handleNotFound(); });
+}
+
+void loopDvice()
+{
+    iotWebConf.doLoop();
+}
+
+void handleRoot()
+{
+    // -- Let IotWebConf test and handle captive portal requests.
+    if (iotWebConf.handleCaptivePortal())
+    {
+        // -- Captive portal request were already served.
+        return;
+    }
+    String s = "<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>";
+    s += "<title>IotWebConf 03 Custom Parameters</title></head><body>Hello world!";
+    s += "<ul>";
+    s += "<li>String param value: ";
+    s += stringParamValue;
+    s += "<li>Int param value: ";
+    s += atoi(intParamValue);
+    s += "<li>Float param value: ";
+    s += atof(floatParamValue);
+    s += "<li>CheckBox selected: ";
+    //  s += checkboxParam.isChecked();
+    s += "<li>Option selected: ";
+    s += chooserParamValue;
+    s += "</ul>";
+    s += "Go to <a href='config'>configure page</a> to change values.";
+    s += "</body></html>\n";
+
+    server.send(200, "text/html", s);
+}
+
+void configSaved()
+{
+    Serial.println("Configuration was updated.");
+}
+
+bool formValidator(iotwebconf::WebRequestWrapper *webRequestWrapper)
+{
+    Serial.println("Validating form.");
+    bool valid = true;
+
+    /*
+        int l = webRequestWrapper->arg(stringParam.getId()).length();
+        if (l < 3)
+        {
+            stringParam.errorMessage = "Please provide at least 3 characters for this test!";
+            valid = false;
+        }
+        */
+    return valid;
+}
+
+/**
+* @brief Sensor region
+*/
+
+BME280I2C BmeSensor;
+const uint32_t SENSOR_DELAY_MS = DeviceConfig.SensorUpdateInterval*1000; // 30 seconds
+const uint32_t FORCE_SENSOR_PERIOD_MS = DeviceConfig.SensorForceUpdateInterval*60*1000; // 30 minute
+#define V_TEMP 0
+#define V_HUM 1
+
+int fromNode = DeviceConfig.SensorNodeId;
+char tempTopic[TOPIC_SIZE];
+int tempSensorId = DeviceConfig.TempSensorId; // Configurable
+char humTopic[TOPIC_SIZE];
+int humSensorId = DeviceConfig.HumiditySensorId; // Configurable
+
+const float INVALID_SENSOR_VALUE = -10000;
+const float TEMPERATURE_DELTA = DeviceConfig.TemperatureSensorDelta;
+const float HUMIDITY_DELTA = DeviceConfig.HumiditySensorDelta;
+
+struct SensorDataStruct
+{
+    float Humidity = INVALID_SENSOR_VALUE;
+    float Temperature = INVALID_SENSOR_VALUE;
+    float Pressure = INVALID_SENSOR_VALUE;
+} SensorData;
+
+void setupSensors()
+{
+    Wire.begin();
+
+    while(!BmeSensor.begin())
+    {
+        Serial.println("Could not find BME280 sensor!");
+        delay(1000);
+    }
+}
+
+void readSensors(SensorDataStruct &data)
+{
+    BmeSensor.read(data.Pressure, data.Temperature, data.Humidity, BME280::TempUnit_Celsius, BME280::PresUnit_Pa);
+}
+
+/* End sensor configuration */
 
 void callback(char *topic, byte *payload, unsigned int length)
 {
@@ -136,14 +322,14 @@ void callback(char *topic, byte *payload, unsigned int length)
 void reconnect()
 {
     // Loop until we're reconnected
-    while (!client.connected())
+    while (!LocalMqttClient.connected())
     {
         Serial.print("Attempting MQTT connection...");
         // Create a random client ID
         String clientId = "ESP8266Client-";
         clientId += String(random(0xffff), HEX);
         // Attempt to connect
-        if (client.connect(clientId.c_str()))
+        if (LocalMqttClient.connect(clientId.c_str()))
         {
             Serial.println("connected");
             // Once connected, publish an announcement...
@@ -154,7 +340,7 @@ void reconnect()
         else
         {
             Serial.print("failed, rc=");
-            Serial.print(client.state());
+            Serial.print(LocalMqttClient.state());
             Serial.println(" try again in 5 seconds");
             // Wait 5 seconds before retrying
             delay(5000);
@@ -166,49 +352,62 @@ void setup()
 {
     pinMode(BUILTIN_LED, OUTPUT);     // Initialize the BUILTIN_LED pin as an output
     Serial.begin(115200);
-    setup_topics();
-    setup_wifi();
-    setup_bme280();
-    client.setServer(mqtt_server, 1883);
-    client.setCallback(callback);
-    _dhtSensor.begin();
+    setupMqttTopics();
+    setupWifi();
+    setupSensors();
+    LocalMqttClient.setServer(mqtt_server, 1883);
+    LocalMqttClient.setCallback(callback);
 }
 
 void loop()
 {
-    if (!client.connected())
+    if (!LocalMqttClient.connected())
     {
         reconnect();
     }
-    client.loop();
+    LocalMqttClient.loop();
 
+    // Check conditions for force update
     unsigned long now = millis();
+    bool forceUpdate = false;
+    if (now - lastMsg > FORCE_SENSOR_PERIOD_MS ||
+            SensorData.Humidity == INVALID_SENSOR_VALUE ||
+            SensorData.Temperature == INVALID_SENSOR_VALUE
+    )
+    {
+        forceUpdate = true;
+    }
+
     if (now - lastMsg > SENSOR_DELAY)
     {
         lastMsg = now;
-        float humidity = NAN;
-        float temp = NAN;
-        float pres(NAN);
 
-        bme.read(pres, temp, humidity, BME280::TempUnit_Celsius, BME280::PresUnit_Pa);
+        SensorDataStruct data;
+        readSensors(data);
 
-        if (_dhtHumidity == INVALID_VALUE || abs(_dhtHumidity - humidity) > HUMIDITY_DELTA)
+        // Ignore invalid sensor data
+        if (data.Humidity == INVALID_SENSOR_VALUE || data.Temperature == INVALID_SENSOR_VALUE ||
+                data.Humidity == NAN || data.Temperature == NAN)
         {
-            _dhtHumidity = humidity;
-            snprintf(msg, MSG_BUFFER_SIZE, "%.2f", _dhtHumidity);
-            Serial.print("Publish message: ");
-            Serial.println(msg);
-            client.publish(humTopic, msg);
-
+            return;
         }
 
-        if (_dhtTemperature == INVALID_VALUE || abs(_dhtTemperature - temp) > TEMPERATURE_DELTA)
+        if (forceUpdate || abs(SensorData.Humidity - data.Humidity) > HUMIDITY_DELTA)
         {
-            _dhtTemperature = temp;
-            snprintf(msg, MSG_BUFFER_SIZE, "%.2f", _dhtTemperature);
+            SensorData.Humidity = data.Humidity;
+            snprintf(msg, MSG_BUFFER_SIZE, "%.2f", SensorData.Humidity);
             Serial.print("Publish message: ");
             Serial.println(msg);
-            client.publish(tempTopic, msg);
+            LocalMqttClient.publish(humTopic, msg);
+        }
+
+        if (forceUpdate || abs(SensorData.Temperature - data.Temperature) > TEMPERATURE_DELTA)
+        {
+            SensorData.Temperature = data.Temperature;
+            snprintf(msg, MSG_BUFFER_SIZE, "%.2f", SensorData.Temperature);
+            Serial.print("Publish message: ");
+            Serial.println(msg);
+            LocalMqttClient.publish(tempTopic, msg);
         }
     }
 }
